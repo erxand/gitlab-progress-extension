@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "GitLab MR Review Progress",
+  "description": "Shows a live progress indicator of viewed files on GitLab merge request 'Changes' pages.",
+  "version": "0.1.0",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://gitlab.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "host_permissions": [
+    "*://*/*"
+  ],
+  "permissions": []
+}
