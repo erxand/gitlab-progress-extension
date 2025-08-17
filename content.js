@@ -7,6 +7,7 @@
   const WIDGET_ID = "gl-mr-progress-root";
   const SHADOW_HOST_ID = "gl-mr-progress-shadow-host";
   const fileStateByKey = new Map();
+  const fileLinesByKey = new Map();
   let updateThemeScheduled = false;
 
   const throttle = (fn, waitMs) => {
@@ -78,14 +79,6 @@
     return `rgba(${Math.round(c.r)}, ${Math.round(c.g)}, ${Math.round(
       c.b
     )}, ${clamp01(a)})`;
-  }
-
-  function relativeLuminance(c) {
-    const srgb = [c.r, c.g, c.b].map((v) => v / 255);
-    const lin = srgb.map((v) =>
-      v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)
-    );
-    return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
   }
 
   function mixColors(c1, c2, ratio) {
@@ -161,14 +154,19 @@
 
     root.innerHTML = `
       <div class="container drag" title="GitLab MR Review Progress">
-        <div class="row">
-          <div class="label">Reviewed</div>
-          <div class="value" id="gl-mr-progress-counts">0 / 0 (0%)</div>
+        <div class="section">
+          <div class="row">
+            <div class="label">Files Viewed</div>
+            <div class="value" id="gl-mr-progress-counts">0 / 0 (0%)</div>
+          </div>
+          <div class="bar"><span id="gl-mr-files-bar"></span></div>
         </div>
-        <div class="bar"><span id="gl-mr-progress-bar"></span></div>
-        <div class="footer">
-          <div id="gl-mr-progress-remaining" class="muted">0 remaining</div>
-          <div id="gl-mr-progress-source" class="muted">DOM</div>
+        <div class="section" style="margin-top:10px;">
+          <div class="row">
+            <div class="label">Lines Viewed</div>
+            <div class="value" id="gl-mr-lines-counts">0 / 0 (0%)</div>
+          </div>
+          <div class="bar"><span id="gl-mr-lines-bar"></span></div>
         </div>
       </div>
     `;
@@ -179,7 +177,9 @@
       host,
       shadow,
       countsEl: shadow.getElementById("gl-mr-progress-counts"),
-      barEl: shadow.getElementById("gl-mr-progress-bar"),
+      linesCountsEl: shadow.getElementById("gl-mr-lines-counts"),
+      barEl: shadow.getElementById("gl-mr-files-bar"),
+      linesBarEl: shadow.getElementById("gl-mr-lines-bar"),
       remainingEl: shadow.getElementById("gl-mr-progress-remaining"),
       sourceEl: shadow.getElementById("gl-mr-progress-source"),
     };
@@ -265,6 +265,35 @@
     return null;
   }
 
+  function parseAddedRemovedFromText(text) {
+    if (!text) return null;
+    const s = String(text).replace(/\u2212/g, "-");
+    const addMatch = s.match(/[+]\s*(\d{1,7})/);
+    const remMatch = s.match(/[-]\s*(\d{1,7})/);
+    if (!addMatch && !remMatch) return null;
+    const added = addMatch ? parseInt(addMatch[1], 10) : 0;
+    const removed = remMatch ? parseInt(remMatch[1], 10) : 0;
+    return { added, removed };
+  }
+
+  function getDeclaredLinesFromHeader() {
+    const containers = [
+      '[data-testid="diff-stats"]',
+      ".diff-stats",
+      ".diff-stats-summary",
+      ".js-diff-stats",
+      ".merge-request .diff-stats",
+    ];
+    for (const sel of containers) {
+      const els = Array.from(document.querySelectorAll(sel));
+      for (const el of els) {
+        const pr = parseAddedRemovedFromText(el.textContent);
+        if (pr && (pr.added > 0 || pr.removed > 0)) return pr;
+      }
+    }
+    return null;
+  }
+
   function getDiffFileContainers() {
     const selectors = [
       '[data-testid="diff-file"]',
@@ -286,6 +315,55 @@
       }
     }
     return unique;
+  }
+
+  function setFileStateForContainer(container, viewed) {
+    const key = getFileKeyFromElement(container);
+    if (!key) return;
+    fileStateByKey.set(key, !!viewed);
+    const lr = getFileAddedRemoved(container);
+    if (lr) fileLinesByKey.set(key, { a: lr.added || 0, d: lr.removed || 0 });
+  }
+
+  function getFileAddedRemoved(container) {
+    if (!container) return null;
+    const scopes = [
+      '[data-testid="file-header"]',
+      ".file-header",
+      ".diff-file-title",
+      "header",
+    ];
+    let header = null;
+    for (const sel of scopes) {
+      const h = container.querySelector(sel);
+      if (h) {
+        header = h;
+        break;
+      }
+    }
+    const target = header || container;
+    const statSelectors = [
+      ".diff-stats",
+      ".file-stats",
+      ".gl-text-green",
+      ".gl-text-red",
+      ".text-success",
+      ".text-danger",
+      '[data-testid="added-lines"]',
+      '[data-testid="removed-lines"]',
+    ];
+    for (const sel of statSelectors) {
+      const parts = target.querySelectorAll(sel);
+      if (parts && parts.length) {
+        const pr = parseAddedRemovedFromText(
+          Array.from(parts)
+            .map((p) => p.textContent)
+            .join(" ")
+        );
+        if (pr) return pr;
+      }
+    }
+    return parseAddedRemovedFromText(target.textContent);
   }
 
   function getFileKeyFromElement(el) {
@@ -357,8 +435,8 @@
     // Merge states from file tree (likely complete) and visible diff containers
     const treeEntries = harvestFromFileTree();
     for (const [key, viewed] of treeEntries) {
-      if (!fileStateByKey.has(key)) fileStateByKey.set(key, viewed);
-      else if (viewed) fileStateByKey.set(key, true);
+      if (viewed) fileStateByKey.set(key, true);
+      // Do not force false here; tree may virtualize and momentarily hide state
     }
     const containers = getDiffFileContainers();
     for (const c of containers) {
@@ -372,8 +450,9 @@
         !!c.querySelector(
           'input[type="checkbox"]:checked, input[type="checkbox"][aria-checked="true"]'
         );
-      if (!fileStateByKey.has(key)) fileStateByKey.set(key, viewed);
-      else if (viewed) fileStateByKey.set(key, true);
+      if (viewed) fileStateByKey.set(key, true);
+      const lr = getFileAddedRemoved(c);
+      if (lr) fileLinesByKey.set(key, { a: lr.added || 0, d: lr.removed || 0 });
     }
 
     const declaredTotal = getDeclaredTotalFromTabs();
@@ -383,7 +462,22 @@
         : Math.max(fileStateByKey.size, containers.length);
     let viewed = 0;
     for (const v of fileStateByKey.values()) if (v) viewed += 1;
-    return { total, viewed };
+    // Lines: total from header when available, else sum of parsed per-file values
+    const declaredLines = getDeclaredLinesFromHeader();
+    let totalLines = 0;
+    if (declaredLines) {
+      totalLines = (declaredLines.added || 0) + (declaredLines.removed || 0);
+    } else {
+      for (const { a, d } of fileLinesByKey.values())
+        totalLines += (a || 0) + (d || 0);
+    }
+    let reviewedLines = 0;
+    for (const [key, state] of fileStateByKey.entries()) {
+      if (!state) continue;
+      const lr = fileLinesByKey.get(key);
+      if (lr) reviewedLines += (lr.a || 0) + (lr.d || 0);
+    }
+    return { total, viewed, totalLines, reviewedLines };
   }
 
   let ui = createShadowUi();
@@ -461,11 +555,16 @@
     if (ui.host) ui.host.style.display = onDiffs ? "block" : "none";
     if (!onDiffs) return;
     updateThemeVariables();
-    const { total, viewed } = computeProgress();
+    const { total, viewed, totalLines, reviewedLines } = computeProgress();
     const percent = total > 0 ? Math.round((viewed / total) * 100) : 0;
+    const percentLines =
+      totalLines > 0 ? Math.round((reviewedLines / totalLines) * 100) : 0;
     if (ui.countsEl)
       ui.countsEl.textContent = `${viewed} / ${total} (${percent}%)`;
+    if (ui.linesCountsEl)
+      ui.linesCountsEl.textContent = `${reviewedLines} / ${totalLines} (${percentLines}%)`;
     if (ui.barEl) ui.barEl.style.width = `${percent}%`;
+    if (ui.linesBarEl) ui.linesBarEl.style.width = `${percentLines}%`;
     if (ui.remainingEl)
       ui.remainingEl.textContent = `${Math.max(0, total - viewed)} remaining`;
     if (ui.sourceEl)
@@ -481,6 +580,10 @@
         const target = e.target;
         if (!(target instanceof HTMLInputElement)) return;
         if (target.type !== "checkbox") return;
+        const container = target.closest(
+          '[data-testid*="diff-file"], .diff-file, .file-holder, li.file, .file'
+        );
+        if (container) setFileStateForContainer(container, !!target.checked);
         updateUi();
       },
       true
@@ -498,14 +601,44 @@
         }
         if (m.type === "attributes") {
           const name = m.attributeName || "";
-          if (
-            name === "checked" ||
-            name === "aria-checked" ||
-            name === "class" ||
-            name === "data-viewed"
-          ) {
-            updateUi();
-            continue;
+          if (name === "checked" || name === "aria-checked") {
+            const t = m.target;
+            if (t instanceof HTMLInputElement && t.type === "checkbox") {
+              const container = t.closest(
+                '[data-testid*="diff-file"], .diff-file, .file-holder, li.file, .file'
+              );
+              if (container)
+                setFileStateForContainer(
+                  container,
+                  t.checked || t.getAttribute("aria-checked") === "true"
+                );
+              updateUi();
+              continue;
+            }
+          }
+          if (name === "class" || name === "data-viewed") {
+            const el = m.target;
+            if (el instanceof HTMLElement) {
+              const container = el.matches(
+                '[data-testid*="diff-file"], .diff-file, .file-holder, li.file, .file'
+              )
+                ? el
+                : el.closest(
+                    '[data-testid*="diff-file"], .diff-file, .file-holder, li.file, .file'
+                  );
+              if (container) {
+                const viewed =
+                  container.classList.contains("is-viewed") ||
+                  container.classList.contains("viewed") ||
+                  container.getAttribute("data-viewed") === "true" ||
+                  !!container.querySelector(
+                    'input[type="checkbox"]:checked, input[type="checkbox"][aria-checked="true"]'
+                  );
+                setFileStateForContainer(container, viewed);
+                updateUi();
+                continue;
+              }
+            }
           }
         }
       }
