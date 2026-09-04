@@ -1,8 +1,17 @@
 {
   "manifest_version": 3,
   "name": "GitLab MR Review Progress",
-  "description": "Shows a live progress indicator of viewed files on GitLab merge request 'Changes' pages.",
-  "version": "0.1.0",
+  "description": "Shows a live progress indicator of viewed files and lines on GitLab merge request 'Changes' pages.",
+  "version": "0.2.0",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "gitlab-mr-review-progress@xanderhunt.dev",
+      "strict_min_version": "142.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  },
   "content_scripts": [
     {
       "matches": [
@@ -11,12 +20,8 @@
       "js": [
         "content.js"
       ],
-      "run_at": "document_idle",
-      "all_frames": true
+      "run_at": "document_idle"
     }
-  ],
-  "host_permissions": [
-    "*://*/*"
   ],
   "permissions": []
 }

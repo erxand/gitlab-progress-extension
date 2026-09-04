@@ -6,6 +6,7 @@
 
   const WIDGET_ID = "gl-mr-progress-root";
   const SHADOW_HOST_ID = "gl-mr-progress-shadow-host";
+  // Legacy (pre "Rapid Diffs") state, keyed by file path/name harvested from the DOM.
   const fileStateByKey = new Map();
   const fileLinesByKey = new Map();
   let updateThemeScheduled = false;
@@ -168,6 +169,10 @@
           </div>
           <div class="bar"><span id="gl-mr-lines-bar"></span></div>
         </div>
+        <div class="footer">
+          <span class="muted" id="gl-mr-progress-remaining"></span>
+          <span class="muted" id="gl-mr-progress-source"></span>
+        </div>
       </div>
     `;
 
@@ -256,7 +261,7 @@
       const els = Array.from(document.querySelectorAll(sel));
       for (const el of els) {
         const badge = el.querySelector(
-          ".gl-tab-counter-badge, .badge, .badge-counter, .counter"
+          ".js-changes-tab-count, .gl-tab-counter-badge, .badge, .badge-counter, .counter"
         );
         const val = textToIntOrNull(badge ? badge.textContent : el.textContent);
         if (val != null && val > 0) return val;
@@ -267,7 +272,7 @@
 
   function parseAddedRemovedFromText(text) {
     if (!text) return null;
-    const s = String(text).replace(/\u2212/g, "-");
+    const s = String(text).replace(/−/g, "-");
     const addMatch = s.match(/[+]\s*(\d{1,7})/);
     const remMatch = s.match(/[-]\s*(\d{1,7})/);
     if (!addMatch && !remMatch) return null;
@@ -275,6 +280,245 @@
     const removed = remMatch ? parseInt(remMatch[1], 10) : 0;
     return { added, removed };
   }
+
+  // ---------------------------------------------------------------------------
+  // Rapid Diffs (GitLab 18.x "Changes" tab)
+  //
+  // The page is server-rendered as a list of <diff-file> custom elements inside
+  // a `[data-rapid-diffs]` root. The root carries a JSON `data-app-data`
+  // attribute with the MR path and the metadata endpoints GitLab itself uses.
+  // Viewed state is persisted by GitLab in localStorage under
+  // `code-review-<mr_path>` as an array of `code_review_id` values, and is also
+  // mirrored on each file's <article> as a `data-viewed` attribute.
+  //
+  // Counting every file exactly once by its `code_review_id` is what fixes the
+  // double counting that the old DOM heuristics produced on this layout.
+  // ---------------------------------------------------------------------------
+
+  function getRapidDiffsRoot() {
+    return document.querySelector("[data-rapid-diffs]");
+  }
+
+  let rapidAppDataCache = { raw: null, parsed: null };
+
+  function getRapidAppData(root) {
+    if (!root) return null;
+    const raw = root.getAttribute("data-app-data");
+    if (!raw) return null;
+    if (rapidAppDataCache.raw === raw) return rapidAppDataCache.parsed;
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (_) {
+      parsed = null;
+    }
+    rapidAppDataCache = { raw, parsed };
+    return parsed;
+  }
+
+  // Per-file metadata for the whole MR (not just the files currently rendered).
+  const rapidMeta = {
+    endpoint: null,
+    files: null, // [{ id, hash, path, added, removed }]
+    loading: false,
+    failed: false,
+    fetchedAt: 0,
+  };
+
+  function normalizeMetaFiles(json) {
+    const list = (json && json.diff_files) || [];
+    const files = [];
+    const seen = new Set();
+    for (const f of list) {
+      if (!f) continue;
+      const id = f.code_review_id || f.file_identifier_hash || f.file_hash;
+      const hash = f.file_hash || null;
+      if (!id && !hash) continue;
+      // Dedupe on the (id, hash) pair so two distinct files never collapse
+      // into one even if GitLab hands out the same id for both.
+      const dedupeKey = `${id}|${hash}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      files.push({
+        id,
+        hash,
+        path: f.new_path || f.old_path || "",
+        added: Number(f.added_lines) || 0,
+        removed: Number(f.removed_lines) || 0,
+      });
+    }
+    return files;
+  }
+
+  function ensureRapidMetadata(endpoint) {
+    if (!endpoint) return;
+    const url = new URL(endpoint, location.origin).toString();
+    if (rapidMeta.endpoint === url) {
+      // Retry a failed fetch every 15s at most.
+      if (!rapidMeta.failed || Date.now() - rapidMeta.fetchedAt < 15000) return;
+    }
+    rapidMeta.endpoint = url;
+    rapidMeta.files = null;
+    rapidMeta.loading = true;
+    rapidMeta.failed = false;
+    rapidMeta.fetchedAt = Date.now();
+    fetch(url, {
+      credentials: "same-origin",
+      headers: {
+        Accept: "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+      },
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((json) => {
+        if (rapidMeta.endpoint !== url) return;
+        rapidMeta.files = normalizeMetaFiles(json);
+        rapidMeta.loading = false;
+        updateUi();
+      })
+      .catch(() => {
+        if (rapidMeta.endpoint !== url) return;
+        rapidMeta.loading = false;
+        rapidMeta.failed = true;
+        updateUi();
+      });
+  }
+
+  // Returns { ids: Set, ok: boolean }. `ok` is false when localStorage could
+  // not be read at all (then the DOM is our only source of truth).
+  function getViewedIdsFromStorage(mrPath) {
+    const ids = new Set();
+    if (!mrPath) return { ids, ok: false };
+    try {
+      const raw = localStorage.getItem(`code-review-${mrPath}`);
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr))
+          for (const id of arr) if (id) ids.add(String(id));
+      }
+      return { ids, ok: true };
+    } catch (_) {
+      return { ids, ok: false };
+    }
+  }
+
+  function getRapidDomFiles() {
+    // One entry per <diff-file> element currently rendered.
+    const out = [];
+    const els = document.querySelectorAll("diff-file");
+    for (const el of els) {
+      const id = el.getAttribute("data-code-review-id") || null;
+      const hash = el.id || null;
+      if (!id && !hash) continue;
+      const article = el.firstElementChild;
+      const checkbox = el.querySelector("[data-viewed-checkbox]");
+      const viewed =
+        !!(article && article.hasAttribute("data-viewed")) ||
+        !!(checkbox && checkbox.checked);
+      // GitLab enables the checkbox only once the file is mounted and its
+      // viewed state has been applied. Before that, "unchecked" means nothing.
+      const mounted = !!(checkbox && !checkbox.disabled);
+      const stats = el.querySelector(
+        '[data-testid="rd-diff-file-stats"], .rd-diff-file-stats'
+      );
+      const lr = stats ? parseAddedRemovedFromText(stats.textContent) : null;
+      out.push({
+        id: id || hash,
+        hash,
+        viewed,
+        mounted,
+        path: (el.querySelector(".rd-diff-file-title") || el).textContent.trim(),
+        added: lr ? lr.added : 0,
+        removed: lr ? lr.removed : 0,
+      });
+    }
+    return out;
+  }
+
+  let lastRemainingSignature = null;
+
+  function computeRapidProgress(root) {
+    const appData = getRapidAppData(root) || {};
+    ensureRapidMetadata(appData.diff_files_endpoint);
+
+    const domFiles = getRapidDomFiles();
+    const storage = getViewedIdsFromStorage(appData.mr_path);
+    const viewedIds = storage.ids;
+    const viewedHashes = new Set();
+    // GitLab writes localStorage and the data-viewed attribute in the same
+    // click handler, so storage is authoritative whenever it is readable.
+    // Rendered files add to it (covers a missing/unreadable storage entry);
+    // they only remove from it when storage itself could not be read.
+    for (const f of domFiles) {
+      if (f.viewed) {
+        if (f.id) viewedIds.add(f.id);
+        if (f.hash) viewedHashes.add(f.hash);
+      } else if (!storage.ok && f.mounted) {
+        viewedIds.delete(f.id);
+      }
+    }
+
+    let files = rapidMeta.files;
+    let source = "metadata";
+    if (!files) {
+      // Fall back to whatever is rendered while metadata loads (or if it failed).
+      files = domFiles;
+      source = rapidMeta.loading ? "loading" : "DOM";
+    }
+
+    let total = files.length;
+    const declaredTotal = getDeclaredTotalFromTabs();
+    if (source !== "metadata" && declaredTotal != null && declaredTotal > total)
+      total = declaredTotal;
+
+    let viewed = 0;
+    let totalLines = 0;
+    let reviewedLines = 0;
+    const remaining = [];
+    for (const f of files) {
+      const lines = (f.added || 0) + (f.removed || 0);
+      totalLines += lines;
+      // Match by code_review_id first, then by file hash as a safety net in
+      // case the page and the metadata endpoint disagree on the id.
+      const isViewed =
+        (f.id && viewedIds.has(f.id)) || (f.hash && viewedHashes.has(f.hash));
+      if (isViewed) {
+        viewed += 1;
+        reviewedLines += lines;
+      } else {
+        remaining.push(f);
+      }
+    }
+
+    // Help debugging "off by one" reports: whenever the set of unviewed files
+    // changes and is small, list them once in the console.
+    if (source === "metadata" && remaining.length <= 10) {
+      const signature = remaining.map((f) => f.id || f.hash).join(",");
+      if (signature !== lastRemainingSignature) {
+        lastRemainingSignature = signature;
+        if (remaining.length) {
+          console.info(
+            "[GitLab MR Progress] Not yet viewed:",
+            remaining.map((f) => `${f.path} (+${f.added} -${f.removed})`)
+          );
+        }
+      }
+    }
+
+    return { total, viewed, totalLines, reviewedLines, source };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Legacy (Vue-rendered) diffs view. Kept for older GitLab instances and for
+  // users who turned Rapid Diffs off. Only used when no [data-rapid-diffs]
+  // root exists on the page.
+  // ---------------------------------------------------------------------------
+
+  const LEGACY_CONTAINER_SELECTOR =
+    '[data-testid="diff-file"], .diff-file, .file-holder, li.file';
 
   function getDeclaredLinesFromHeader() {
     const containers = [
@@ -295,26 +539,13 @@
   }
 
   function getDiffFileContainers() {
-    const selectors = [
-      '[data-testid="diff-file"]',
-      ".diff-file",
-      ".file-holder",
-      "li.file",
-      ".file",
-    ];
-    const all = selectors.flatMap((sel) =>
-      Array.from(document.querySelectorAll(sel))
+    const all = Array.from(document.querySelectorAll(LEGACY_CONTAINER_SELECTOR));
+    // Keep only outermost matches so a nested wrapper never counts twice.
+    return all.filter(
+      (el) =>
+        el instanceof HTMLElement &&
+        !(el.parentElement && el.parentElement.closest(LEGACY_CONTAINER_SELECTOR))
     );
-    const seen = new Set();
-    const unique = [];
-    for (const el of all) {
-      if (!(el instanceof HTMLElement)) continue;
-      if (!seen.has(el)) {
-        seen.add(el);
-        unique.push(el);
-      }
-    }
-    return unique;
   }
 
   function setFileStateForContainer(container, viewed) {
@@ -431,7 +662,7 @@
     return entries;
   }
 
-  function computeProgress() {
+  function computeLegacyProgress() {
     // Merge states from file tree (likely complete) and visible diff containers
     const treeEntries = harvestFromFileTree();
     for (const [key, viewed] of treeEntries) {
@@ -440,9 +671,8 @@
     }
     const containers = getDiffFileContainers();
     for (const c of containers) {
-      const key =
-        getFileKeyFromElement(c) ||
-        `__idx_${Math.random().toString(36).slice(2)}`;
+      const key = getFileKeyFromElement(c);
+      if (!key) continue;
       const viewed =
         c.classList.contains("is-viewed") ||
         c.classList.contains("viewed") ||
@@ -477,7 +707,19 @@
       const lr = fileLinesByKey.get(key);
       if (lr) reviewedLines += (lr.a || 0) + (lr.d || 0);
     }
-    return { total, viewed, totalLines, reviewedLines };
+    return {
+      total,
+      viewed: Math.min(viewed, total || viewed),
+      totalLines,
+      reviewedLines,
+      source: "legacy",
+    };
+  }
+
+  function computeProgress() {
+    const rapidRoot = getRapidDiffsRoot();
+    if (rapidRoot) return computeRapidProgress(rapidRoot);
+    return computeLegacyProgress();
   }
 
   let ui = createShadowUi();
@@ -555,7 +797,8 @@
     if (ui.host) ui.host.style.display = onDiffs ? "block" : "none";
     if (!onDiffs) return;
     updateThemeVariables();
-    const { total, viewed, totalLines, reviewedLines } = computeProgress();
+    const { total, viewed, totalLines, reviewedLines, source } =
+      computeProgress();
     const percent = total > 0 ? Math.round((viewed / total) * 100) : 0;
     const percentLines =
       totalLines > 0 ? Math.round((reviewedLines / totalLines) * 100) : 0;
@@ -567,24 +810,29 @@
     if (ui.linesBarEl) ui.linesBarEl.style.width = `${percentLines}%`;
     if (ui.remainingEl)
       ui.remainingEl.textContent = `${Math.max(0, total - viewed)} remaining`;
-    if (ui.sourceEl)
-      ui.sourceEl.textContent =
-        getDeclaredTotalFromTabs() != null ? "Tabs+DOM" : "DOM";
+    if (ui.sourceEl) {
+      if (source === "loading") ui.sourceEl.textContent = "loading…";
+      else if (source === "DOM") ui.sourceEl.textContent = "partial";
+      else ui.sourceEl.textContent = "";
+    }
   }, 120);
 
   function bindLiveUpdates() {
-    // Respond to checkbox changes
+    // Respond to checkbox changes (both layouts render "Viewed" as a checkbox)
     document.addEventListener(
       "change",
       (e) => {
         const target = e.target;
         if (!(target instanceof HTMLInputElement)) return;
         if (target.type !== "checkbox") return;
-        const container = target.closest(
-          '[data-testid*="diff-file"], .diff-file, .file-holder, li.file, .file'
-        );
-        if (container) setFileStateForContainer(container, !!target.checked);
+        if (!getRapidDiffsRoot()) {
+          const container = target.closest(LEGACY_CONTAINER_SELECTOR);
+          if (container) setFileStateForContainer(container, !!target.checked);
+        }
+        // GitLab flips data-viewed / localStorage in its own click handler,
+        // which may run after this event. Recompute now and shortly after.
         updateUi();
+        setTimeout(updateUi, 150);
       },
       true
     );
@@ -601,12 +849,16 @@
         }
         if (m.type === "attributes") {
           const name = m.attributeName || "";
+          if (getRapidDiffsRoot()) {
+            // Rapid Diffs: any tracked attribute flip means recompute from
+            // authoritative sources; no per-element bookkeeping needed.
+            updateUi();
+            continue;
+          }
           if (name === "checked" || name === "aria-checked") {
             const t = m.target;
             if (t instanceof HTMLInputElement && t.type === "checkbox") {
-              const container = t.closest(
-                '[data-testid*="diff-file"], .diff-file, .file-holder, li.file, .file'
-              );
+              const container = t.closest(LEGACY_CONTAINER_SELECTOR);
               if (container)
                 setFileStateForContainer(
                   container,
@@ -619,13 +871,9 @@
           if (name === "class" || name === "data-viewed") {
             const el = m.target;
             if (el instanceof HTMLElement) {
-              const container = el.matches(
-                '[data-testid*="diff-file"], .diff-file, .file-holder, li.file, .file'
-              )
+              const container = el.matches(LEGACY_CONTAINER_SELECTOR)
                 ? el
-                : el.closest(
-                    '[data-testid*="diff-file"], .diff-file, .file-holder, li.file, .file'
-                  );
+                : el.closest(LEGACY_CONTAINER_SELECTOR);
               if (container) {
                 const viewed =
                   container.classList.contains("is-viewed") ||
@@ -646,6 +894,7 @@
 
     // Try to find a stable diffs container; fallback to body
     const diffsContainer =
+      document.querySelector("[data-rapid-diffs]") ||
       document.querySelector('[data-testid="diffs-container"]') ||
       document.querySelector("#diffs, .merge-request, .content-wrapper, body");
 
