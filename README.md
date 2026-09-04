@@ -2,6 +2,13 @@
 
 Shows a live progress indicator of viewed files and viewed lines on GitLab merge request "Changes" pages. It reads the page (and, on current GitLab, the same file-metadata endpoint the page itself loads) and adapts to GitLab's theme automatically.
 
+### Install (Firefox or Zen)
+
+1. Download the latest signed `.xpi` from the [Releases page](https://github.com/erxand/gitlab-progress-extension/releases/latest).
+2. Open `about:addons`, click the gear icon, choose "Install Add-on From File…", and pick the downloaded `.xpi`.
+
+The `.xpi` is signed by Mozilla's add-on service, so it installs permanently and survives browser restarts. It is distributed here rather than on addons.mozilla.org.
+
 ### How it counts (GitLab "Rapid Diffs", the current Changes tab)
 
 GitLab now renders the Changes tab as a list of `<diff-file>` elements inside a `[data-rapid-diffs]` root. The extension:
@@ -11,6 +18,18 @@ GitLab now renders the Changes tab as a list of `<diff-file>` elements inside a 
 - Falls back to the tab badge and the rendered files while the metadata is loading (the footer shows `loading…`) or if the fetch fails (footer shows `partial`).
 
 Older GitLab instances (or Rapid Diffs turned off) still use the previous DOM heuristics.
+
+### Releasing a new version
+
+1. Bump `version` in `manifest.json` and `package.json`.
+2. Sign (see below) to get a new `.xpi` in `web-ext-artifacts/`.
+3. Commit, tag, and publish a GitHub Release with the `.xpi` attached:
+
+   ```bash
+   git tag v<version>
+   git push origin main --tags
+   gh release create v<version> web-ext-artifacts/*.xpi --title "v<version>" --notes "<what changed>"
+   ```
 
 ### Install for development (temporary load)
 
